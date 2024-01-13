@@ -1,265 +1,318 @@
-__all__ = (
-    "push_kernel",
-    "get_kernel_status",
-    "save_kernel_output",
-    "main",
-)
-
 import argparse
-import asyncio
 import datetime
 import json
-import logging
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
+import time
 
 from dotenv import dotenv_values
 
 
-async def push_kernel(
-    kernel_metadata_dir: str,
-    env: dict[str, str],
-    delay: int = 15,
-) -> str:
-    while True:
-        response = subprocess.run(
-            ["kaggle", "kernels", "push", "-p", kernel_metadata_dir],
-            env=env,
-            capture_output=True,
-        )
-
-        stdout = response.stdout.decode()
-        stderr = response.stderr.decode()
-
-        if "push error: Maximum batch CPU" in stdout or "MaxRetryError" in stderr:
-            await asyncio.sleep(delay)
-            continue
-
-        _, username, kernel_slug = stdout.strip().rsplit("/", 2)
-        kernel_ref = f"{username}/{kernel_slug}"
-
-        return kernel_ref
+class KaggleError(Exception):
+    pass
 
 
-async def get_kernel_status(
-    kernel_ref: str, env: dict[str, str], delay: int = 15
-) -> str:
-    while True:
-        response = subprocess.run(
-            ["kaggle", "kernels", "status", kernel_ref],
-            env=env,
-            capture_output=True,
-        )
-
-        stdout = response.stdout.decode()
-        stderr = response.stderr.decode()
-
-        if "MaxRetryError" in stderr:
-            await asyncio.sleep(delay)
-            continue
-
-        return stdout.split('"')[1]
+class KaggleLimitError(KaggleError):
+    pass
 
 
-async def save_kernel_output(
-    output_dir: str, kernel_ref: str, env: dict[str, str], delay: int = 15
-):
-    while True:
-        response = subprocess.run(
-            ["kaggle", "kernels", "output", kernel_ref, "-p", output_dir],
-            env=env,
-            capture_output=True,
-        )
-
-        stderr = response.stderr.decode()
-
-        if "MaxRetryError" in stderr:
-            await asyncio.sleep(delay)
-            continue
-
-        _username, kernel_slug = kernel_ref.split("/")
-
-        if not os.path.exists(os.path.join(output_dir, f"{kernel_slug}.log")):
-            raise RuntimeError(f"Failed to download the log of kernel {kernel_ref}.")
-
-        return
+class KaggleConnectionError(KaggleError, ConnectionError):
+    pass
 
 
-async def pysearch(
-    kernel_metadata_dir: str,
-    kernel_title: str,
-    env: dict[str, str],
-    logger: logging.Logger = logging.root,
+class KaggleAlreadyPushedError(KaggleError):
+    pass
+
+
+class KaggleKernel:
+    def __init__(
+        self, save_path: str, env: dict[str, str], include_current_env: bool = True
+    ):
+        self.ref = ""
+        self.status = "not_pushed"
+        self.local_env = env
+        self.include_current_env = include_current_env
+        self.save_path = save_path
+
+    @property
+    def env(self) -> dict[str, str]:
+        if self.include_current_env:
+            return self.local_env | os.environ
+        return self.local_env
+
+    @property
+    def pushed(self) -> bool:
+        return self.status != "not_pushed"
+
+    @property
+    def finished(self) -> bool:
+        return self.status in ("complete", "error")
+
+    def push(self, kernel_metadata_dir_path: str):
+        if self.pushed:
+            raise KaggleAlreadyPushedError
+
+        try:
+            response = subprocess.run(
+                ["kaggle", "kernels", "push", "-p", kernel_metadata_dir_path],
+                env=self.env,
+                check=True,
+                capture_output=True,
+                encoding="utf-8",
+            )
+            if "push error: Maximum batch CPU" in response.stdout:
+                raise KaggleLimitError
+        except subprocess.CalledProcessError as exception:
+            if "MaxRetryError" in exception.stderr:
+                raise KaggleConnectionError from exception
+            raise KaggleError from exception
+
+        *_, username, kernel_slug = response.stdout.strip().split("/")
+        self.ref = f"{username}/{kernel_slug}"
+        self.status = "pending"
+
+    def update_status(self):
+        try:
+            response = subprocess.run(
+                ["kaggle", "kernels", "status", self.ref],
+                env=self.env,
+                check=True,
+                capture_output=True,
+                encoding="utf-8",
+            )
+        except subprocess.CalledProcessError as exception:
+            if "MaxRetryError" in exception.stderr:
+                raise KaggleConnectionError from exception
+            raise KaggleError from exception
+
+        self.status = response.stdout.split('"')[1]
+
+    def save_output(self):
+        if not os.path.exists(self.save_path):
+            os.makedirs(self.save_path)
+        try:
+            subprocess.run(
+                ["kaggle", "kernels", "output", self.ref, "-p", self.save_path],
+                env=self.env,
+                check=True,
+                capture_output=True,
+                encoding="utf-8",
+            )
+        except subprocess.CalledProcessError as exception:
+            if "MaxRetryError" in exception.stderr:
+                raise KaggleConnectionError from exception
+            raise KaggleError from exception
+
+
+def pysearch_push(
+    kernel: KaggleKernel,
+    run_path: str,
     chunk_id: int = 0,
     number_of_chunks: int = 1,
-) -> tuple[int, str, str]:
-    assert chunk_id < number_of_chunks
+):
+    assert 0 <= chunk_id < number_of_chunks
 
-    with tempfile.TemporaryDirectory() as kernel_metadata_dir_copy:
-        for item in os.listdir(kernel_metadata_dir):
-            source = os.path.join(kernel_metadata_dir, item)
-            destination = os.path.join(kernel_metadata_dir_copy, item)
-            if os.path.isfile(source):
-                shutil.copy(source, destination)
-            elif os.path.isdir(source):
-                shutil.copytree(source, destination)
+    kernel_metadata_dir_path = os.path.join(run_path, "pysearch")
 
-        kernel_metadata_path = os.path.join(
-            kernel_metadata_dir_copy, "kernel-metadata.json"
+    with tempfile.TemporaryDirectory() as temp_kernel_metadata_dir_path:
+        for filename in os.listdir(kernel_metadata_dir_path):
+            source_file = os.path.join(kernel_metadata_dir_path, filename)
+            dest_file = os.path.join(temp_kernel_metadata_dir_path, filename)
+            shutil.copy(source_file, dest_file)
+
+        kernel_metadata_dir_path = os.path.join(
+            temp_kernel_metadata_dir_path, "kernel-metadata.json"
         )
-
-        with open(kernel_metadata_path, "r") as fp:
+        with open(kernel_metadata_dir_path, "r") as fp:
             kernel_metadata = json.load(fp)
-
-        kernel_metadata["title"] = kernel_title
-
-        with open(kernel_metadata_path, "w") as fp:
+        with open(kernel_metadata_dir_path, "w") as fp:
+            kernel_metadata[
+                "title"
+            ] = f"{os.path.split(run_path)[-1]}-{chunk_id}-{datetime.datetime.now()}"
             json.dump(kernel_metadata, fp)
 
-        code_path = os.path.join(kernel_metadata_dir_copy, kernel_metadata["code_file"])
-
+        code_path = os.path.join(
+            temp_kernel_metadata_dir_path, kernel_metadata["code_file"]
+        )
         with open(code_path, "r") as fp:
             code = fp.read()
-
-        code = code.replace(
-            "NUMBER_OF_CHUNKS: usize = 1",
-            f"NUMBER_OF_CHUNKS: usize = {number_of_chunks}",
-        ).replace("CHUNK_ID: usize = 0", f"CHUNK_ID: usize = {chunk_id}")
-
         with open(code_path, "w") as fp:
+            code = code.replace(
+                "NUMBER_OF_CHUNKS: usize = 1",
+                f"NUMBER_OF_CHUNKS: usize = {number_of_chunks}",
+            ).replace("CHUNK_ID: usize = 0", f"CHUNK_ID: usize = {chunk_id}")
             fp.write(code)
 
-        kernel_ref = await push_kernel(kernel_metadata_dir_copy, env)
-
-    logger.info(f"Started kernel {kernel_ref}")
-
-    with tempfile.TemporaryDirectory() as output_temp_dir:
-        status = ""
-        while status != "complete":
-            new_status = await get_kernel_status(
-                kernel_ref,
-                env,
-            )
-
-            if new_status != status:
-                status = new_status
-                logger.info(f"Kernel {kernel_ref} status: {status}")
-
-            if status == "error":
-                raise RuntimeError(f"Kernel {kernel_ref} failed")
-
-            await asyncio.sleep(15)
-
-        await save_kernel_output(output_temp_dir, kernel_ref, env)
-
-        _username, kernel_slug = kernel_ref.split("/")
-
-        with open(os.path.join(output_temp_dir, f"{kernel_slug}.log")) as fp:
-            stdout = "".join(
-                event["data"]
-                for event in json.load(fp)
-                if event["stream_name"] == "stdout"
-            )
-
-    return chunk_id, kernel_ref, stdout
+        kernel.push(temp_kernel_metadata_dir_path)
 
 
-def chunked_pysearch(
-    kernel_metadata_dir: str,
-    env: dict[str, str],
-    logger: logging.Logger = logging.root,
-    number_of_chunks: int = 1,
-    start_chunk_id: int = 0,
-    end_chunk_id: int | None = None,
-) -> list[asyncio.Task[tuple[int, str, str]]]:
-    if end_chunk_id is None:
-        end_chunk_id = number_of_chunks
-
-    assert 0 <= start_chunk_id < end_chunk_id <= number_of_chunks
-
-    start_datetime = datetime.datetime.now()
-
-    tasks: list[asyncio.Task[tuple[int, str, str]]] = []
-
-    for chunk_id in range(start_chunk_id, end_chunk_id):
-        tasks.append(
-            asyncio.create_task(
-                pysearch(
-                    kernel_metadata_dir,
-                    f"{start_datetime}-chunk-{chunk_id}-{number_of_chunks}",
-                    env,
-                    logger,
-                    chunk_id,
-                    number_of_chunks,
-                )
-            )
+def save_pysearch_kernels(
+    run_path: str, number_of_chunks: int, kernels: dict[int, KaggleKernel]
+):
+    with open(os.path.join(run_path, "kernels.json"), "w") as fp:
+        json.dump(
+            {
+                "number_of_chunks": number_of_chunks,
+                "kernels": {
+                    chunk_id: kernel.__dict__
+                    | {"save_path": os.path.relpath(kernel.save_path, run_path)}
+                    for chunk_id, kernel in kernels.items()
+                },
+            },
+            fp,
         )
-
-    return tasks
-
-
-def _create_logger(name: str, dir_path: str) -> logging.Logger:
-    formatter = logging.Formatter(
-        style="{",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        fmt="{asctime}: {message}",
-    )
-    handler = logging.FileHandler(os.path.join(dir_path, f"{name}.log"), mode="w")
-    handler.setFormatter(formatter)
-    screen_handler = logging.StreamHandler(stream=sys.stdout)
-    screen_handler.setFormatter(formatter)
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    logger.addHandler(handler)
-    logger.addHandler(screen_handler)
-    return logger
+    with open(os.path.join(run_path, "results"), "w") as fp:
+        for chunk_id, kernel in kernels.items():
+            if kernel.finished:
+                fp.write(f"Chunk {chunk_id}\n")
+                try:
+                    with open(
+                        os.path.join(kernel.save_path, "results"), "r"
+                    ) as chunk_fp:
+                        fp.write(chunk_fp.read())
+                except FileExistsError:
+                    fp.write("no results file found")
+                fp.write("\n")
 
 
-async def main():
+def load_pysearch_kernels(run_path: str) -> tuple[int, dict[int, KaggleKernel]]:
+    from typing import Any, cast
+
+    with open(os.path.join(run_path, "kernels.json"), "r") as fp:
+        data: dict[str, Any] = json.load(fp)
+        kernels: dict[int, KaggleKernel] = {}
+        for chunk_id, kernel_data in cast(
+            dict[str, dict[str, object]], data["kernels"]
+        ).items():
+            kernel = KaggleKernel("", {})
+            for k, v in kernel_data.items():
+                setattr(kernel, k, v)
+            kernel.save_path = os.path.join(run_path, kernel.save_path)
+            kernels[int(chunk_id)] = kernel
+        return int(data["number_of_chunks"]), kernels
+
+
+def main():
+    my_path = os.path.dirname(os.path.realpath(__file__))
+
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="Run pysearch in multiple kaggle kernel",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--path",
+    subparsers = parser.add_subparsers(dest="command")
+
+    start_parser = subparsers.add_parser("start", help="Start a new pysearch run.")
+    start_parser.add_argument(
+        "--kernel_path",
         type=str,
-        default=os.path.join(os.path.dirname(os.path.realpath(__file__)), "pysearch"),
-        help="The kernel metadata dir path",
+        default=os.path.join(my_path, "pysearch"),
+        help="The path to the directory containing the kernel metadata.",
     )
-    parser.add_argument(
+    start_parser.add_argument(
+        "--save_path",
+        type=str,
+        default=None,
+        help="The path to the directory where the run data will be stored."
+        f"Defaults to '{os.path.join(my_path, 'runs', 'run_***')}'.",
+    )
+    start_parser.add_argument(
         "--chunks",
         type=int,
         default=1,
-        help="The number of chunks the work is split into",
+        help="The number of chunks the work is split into.",
     )
-    parser.add_argument("--start", type=int, default=0, help="Start chunk id")
-    parser.add_argument(
-        "--end", type=int, default=None, help="End chunk id (exclusive)"
+    start_parser.add_argument("--start", type=int, default=0, help="Start chunk id.")
+    start_parser.add_argument(
+        "--end",
+        type=int,
+        default=None,
+        help="End chunk id (exclusive). If not specified, it will continue until the end.",
     )
+
+    load_parser = subparsers.add_parser("continue", help="Contiune a previous run.")
+    load_parser.add_argument(
+        "path",
+        type=str,
+        help="The path to the directory where the run data is stored.",
+    )
+
     args = parser.parse_args()
 
-    path: str = args.path
-    chunks: int = args.chunks
-    start: int = args.start
-    end: int | None = args.end
+    match args.command:
+        case "start":
+            if args.save_path is None:
+                count = 0
+                while True:
+                    run_path = os.path.join(my_path, "runs", f"run_{count:03d}")
+                    if not os.path.exists(run_path):
+                        break
+                    count += 1
+            else:
+                run_path: str = os.path.abspath(args.save_path)
 
-    output_dir_path = os.path.join(path, "results")
-    os.makedirs(output_dir_path, exist_ok=True)
+            os.makedirs(run_path)
 
-    logger = _create_logger("pysearch", output_dir_path)
+            shutil.copytree(args.kernel_path, os.path.join(run_path, "pysearch"))
 
-    env = os.environ | {k: v or "" for k, v in dotenv_values().items()}
+            env = {k: v or "" for k, v in dotenv_values().items()}
 
-    with open(os.path.join(output_dir_path, "stdout"), "w") as fp:
-        for result in asyncio.as_completed(
-            chunked_pysearch(path, env, logger, chunks, start, end),
-        ):
-            chunk_id, kernel_ref, stdout = await result
-            fp.write(f"Chunk: {chunk_id} Kernel: {kernel_ref}\n{stdout}")
-            fp.flush()
+            number_of_chunks: int = args.chunks
+            kernels: dict[int, KaggleKernel] = {}
+
+            start: int = args.start
+            end: int = args.chunks if args.end is None else args.end
+
+            assert 0 <= start < end <= number_of_chunks
+
+            kernels = {
+                chunk_id: KaggleKernel(
+                    os.path.join(run_path, "kernel_outputs", f"chunk_{chunk_id:03d}"),
+                    env,
+                )
+                for chunk_id in range(start, end)
+            }
+
+            save_pysearch_kernels(run_path, number_of_chunks, kernels)
+
+        case "continue":
+            run_path: str = os.path.abspath(args.path)
+            number_of_chunks, kernels = load_pysearch_kernels(run_path)
+
+        case _:
+            raise ValueError("Invalid command")
+
+    print(f"run_path: {run_path}")
+    print(
+        f"Be cautious your kaggle tokens are stored in {os.path.join('$run_path','kernels.json')}"
+    )
+
+    while any(not k.finished for k in kernels.values()):
+        for chunk_id, kernel in kernels.items():
+            if kernel.finished:
+                continue
+
+            old_status = kernel.status
+
+            if not kernel.pushed:
+                try:
+                    pysearch_push(kernel, run_path, chunk_id, number_of_chunks)
+                except KaggleLimitError:
+                    continue
+
+            kernel.update_status()
+
+            if kernel.status != old_status:
+                print(f"Chunk {chunk_id} status: {kernel.status}")
+
+            if kernel.finished:
+                kernel.save_output()
+
+        save_pysearch_kernels(run_path, number_of_chunks, kernels)
+
+        time.sleep(15)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
