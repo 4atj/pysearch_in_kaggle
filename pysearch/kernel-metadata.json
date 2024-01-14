@@ -1,5 +1,4 @@
 {
-  "id": "{username}/{kernel-slug}",
   "code_file": "pysearch.ipynb",
   "language": "python",
   "kernel_type": "notebook",

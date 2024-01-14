@@ -2,6 +2,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -39,7 +40,7 @@ class KaggleKernel:
     @property
     def env(self) -> dict[str, str]:
         if self.include_current_env:
-            return self.local_env | os.environ
+            return os.environ | self.local_env
         return self.local_env
 
     @property
@@ -48,7 +49,7 @@ class KaggleKernel:
 
     @property
     def finished(self) -> bool:
-        return self.status in ("complete", "error")
+        return self.status in ("complete", "error", "cancelAcknowledged")
 
     def push(self, kernel_metadata_dir_path: str):
         if self.pushed:
@@ -65,6 +66,8 @@ class KaggleKernel:
             if "push error: Maximum batch CPU" in response.stdout:
                 raise KaggleLimitError
         except subprocess.CalledProcessError as exception:
+            if "is already in use" in exception.stdout:
+                raise KaggleAlreadyPushedError from exception
             if "MaxRetryError" in exception.stderr:
                 raise KaggleConnectionError from exception
             raise KaggleError from exception
@@ -92,6 +95,7 @@ class KaggleKernel:
     def save_output(self):
         if not os.path.exists(self.save_path):
             os.makedirs(self.save_path)
+
         try:
             subprocess.run(
                 ["kaggle", "kernels", "output", self.ref, "-p", self.save_path],
@@ -128,9 +132,12 @@ def pysearch_push(
         with open(kernel_metadata_dir_path, "r") as fp:
             kernel_metadata = json.load(fp)
         with open(kernel_metadata_dir_path, "w") as fp:
-            kernel_metadata[
-                "title"
-            ] = f"{os.path.split(run_path)[-1]}-{chunk_id}-{datetime.datetime.now()}"
+            title = (
+                f"{os.path.split(run_path)[-1]}_{chunk_id}_{datetime.datetime.now()}"
+            )
+            slug = re.sub(r"\W+", "-", title).lower().strip("-")
+            kernel_metadata["title"] = title
+            kernel_metadata["id"] = f"{{username}}/{slug}"
             json.dump(kernel_metadata, fp)
 
         code_path = os.path.join(
@@ -172,7 +179,7 @@ def save_pysearch_kernels(
                         os.path.join(kernel.save_path, "results"), "r"
                     ) as chunk_fp:
                         fp.write(chunk_fp.read())
-                except FileExistsError:
+                except FileNotFoundError:
                     fp.write("no results file found")
                 fp.write("\n")
 
@@ -305,11 +312,9 @@ def main():
 
             if kernel.status != old_status:
                 print(f"Chunk {chunk_id} status: {kernel.status}")
-
-            if kernel.finished:
-                kernel.save_output()
-
-        save_pysearch_kernels(run_path, number_of_chunks, kernels)
+                if kernel.finished:
+                    kernel.save_output()
+                save_pysearch_kernels(run_path, number_of_chunks, kernels)
 
         time.sleep(15)
 
