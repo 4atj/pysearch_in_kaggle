@@ -66,6 +66,7 @@ class KaggleKernel:
             if "push error: Maximum batch CPU" in response.stdout:
                 raise KaggleLimitError
         except subprocess.CalledProcessError as exception:
+            print(exception.stdout)
             if "is already in use" in exception.stdout:
                 raise KaggleAlreadyPushedError from exception
             if "MaxRetryError" in exception.stderr:
@@ -208,37 +209,56 @@ def main():
         description="Run pysearch in multiple kaggle kernel",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+
     subparsers = parser.add_subparsers(dest="command")
 
-    start_parser = subparsers.add_parser("start", help="Start a new pysearch run.")
+    start_parser = subparsers.add_parser(
+        "start",
+        description="Start a new pysearch run.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
     start_parser.add_argument(
         "--kernel_path",
         type=str,
         default=os.path.join(my_path, "pysearch"),
         help="The path to the directory containing the kernel metadata.",
     )
+    
     start_parser.add_argument(
         "--save_path",
         type=str,
         default=None,
-        help="The path to the directory where the run data will be stored."
-        f"Defaults to '{os.path.join(my_path, 'runs', 'run_***')}'.",
+        help="The path to the directory where the run data will be stored.",
     )
+
     start_parser.add_argument(
         "--chunks",
         type=int,
         default=1,
         help="The number of chunks the work is split into.",
     )
-    start_parser.add_argument("--start", type=int, default=0, help="Start chunk id.")
+
+    start_parser.add_argument(
+        "--start",
+        type=int,
+        default=0,
+        help="First chunk id in the range of ids of chunks to run."
+    )
+
     start_parser.add_argument(
         "--end",
         type=int,
         default=None,
-        help="End chunk id (exclusive). If not specified, it will continue until the end.",
+        help="End chunk id (exclusive), None is equivalant to the last chunk.",
     )
 
-    load_parser = subparsers.add_parser("continue", help="Contiune a previous run.")
+    load_parser = subparsers.add_parser(
+        "continue",
+        description="Contiune a previous run.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
     load_parser.add_argument(
         "path",
         type=str,
@@ -271,7 +291,8 @@ def main():
             start: int = args.start
             end: int = args.chunks if args.end is None else args.end
 
-            assert 0 <= start < end <= number_of_chunks
+            if not 0 <= start < end <= number_of_chunks:
+                raise ValueError(f"--start, --end values {start}, {end} are inappropriate")
 
             kernels = {
                 chunk_id: KaggleKernel(
@@ -295,6 +316,7 @@ def main():
         f"Be cautious your kaggle tokens are stored in {os.path.join('$run_path','kernels.json')}"
     )
 
+    sleep_amount: int = 30
     while any(not k.finished for k in kernels.values()):
         for chunk_id, kernel in kernels.items():
             if kernel.finished:
@@ -305,18 +327,19 @@ def main():
             if not kernel.pushed:
                 try:
                     pysearch_push(kernel, run_path, chunk_id, number_of_chunks)
+                    time.sleep(sleep_amount)
                 except KaggleLimitError:
-                    continue
+                    pass
 
             kernel.update_status()
+            time.sleep(sleep_amount)
 
             if kernel.status != old_status:
                 print(f"Chunk {chunk_id} status: {kernel.status}")
                 if kernel.finished:
                     kernel.save_output()
+                    time.sleep(sleep_amount)
                 save_pysearch_kernels(run_path, number_of_chunks, kernels)
-
-        time.sleep(15)
 
 
 if __name__ == "__main__":
